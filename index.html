@@ -2826,8 +2826,16 @@ async function syncProjectTasks(p){
   if(!GS.token)return;
   var myEmail=GS.user?GS.user.email.toLowerCase():'';
   try{
+    // Check if this is a new list by comparing stored listId
+    var previousListId=p._gtListId||null;
     var listId=await getOrCreateTaskList(p.name);
-    if(!p._gtListId)p._gtListId=listId;
+    
+    // If list is new (deleted and recreated), clear all gtaskIds so tasks re-push
+    if(previousListId&&previousListId!==listId){
+      p.milestones.forEach(function(m){m.gtaskId='';});
+      changed=true;
+    }
+    p._gtListId=listId;
 
     // Deduplicate existing milestones by name (keep the one with gtaskId if both exist)
     var seen={};
@@ -2861,6 +2869,19 @@ async function syncProjectTasks(p){
 
     var changed=false;
     var myEmail2=myEmail;
+
+    // Clear gtaskIds that no longer exist in Google Tasks (e.g. list was deleted/recreated)
+    var gtIdSet={};
+    gtTasks.forEach(function(gt){gtIdSet[gt.id]=true;});
+    var clearedCount=0;
+    p.milestones.forEach(function(m){
+      if(m.gtaskId&&!gtIdSet[m.gtaskId]){
+        m.gtaskId='';
+        clearedCount++;
+        changed=true;
+      }
+    });
+    if(clearedCount>0)console.log('Cleared '+clearedCount+' stale gtaskId(s)');
 
     // Pull new tasks from Google Tasks into ConstructTrack
     gtTasks.forEach(function(gt){
