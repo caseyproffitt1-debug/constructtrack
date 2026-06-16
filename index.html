@@ -217,6 +217,7 @@ var SHEET_ID_G="1nrlRcO7iTKwVEHg-E50pmwaVfkaJWH9spljn3SaQPX4";
 var SCOPES_G="https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/tasks";
 var GS={token:null,user:null,tokenExpiry:0,tokenClient:null};
 var _tasksSyncedThisSession=false;
+var _syncInProgress=false;
 
 function isTokenValid(){
   return GS.token && Date.now() < GS.tokenExpiry - 60000; // refresh 1min before expiry
@@ -2832,6 +2833,8 @@ async function getOrCreateTaskList(projectName){
 
 async function syncProjectTasks(p){
   if(!GS.token)return;
+  if(_syncInProgress){console.log('Sync already in progress, skipping.');return;}
+  _syncInProgress=true;
   var myEmail=GS.user?GS.user.email.toLowerCase():'';
   try{
     // Check if this is a new list by comparing stored listId
@@ -2972,9 +2975,11 @@ async function syncProjectTasks(p){
       }catch(gtErr){console.warn('Failed to push task:',m.name,gtErr);}
     }
     await Promise.all(savePromises);
-    if(changed){save();render();}
+    if(changed){await save();render();}
+    _syncInProgress=false;
 
   }catch(err){
+    _syncInProgress=false;
     console.warn('Google Tasks sync error for '+p.name+':', err.message);
   }
 }
