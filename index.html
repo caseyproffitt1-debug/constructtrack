@@ -538,6 +538,7 @@ document.addEventListener('click',function(e){
     exportPerf:function(){exportPerfPDF(pid);},
     refreshWeather:function(){refreshWeather();},
     syncTasks:function(){syncAllProjectTasks();},
+    cleanupDupes:function(){cleanupDuplicateTasks(pid);},
     toggleVisibility:function(){
       var p=S.projects.find(function(x){return x.id===pid;});
       var m=p&&(p.milestones||[]).find(function(x){return x.id===id2;});
@@ -1150,6 +1151,7 @@ function rMs(){
   var h='<div class="ph"><div><div class="pt">Task Checklist</div><div class="ps">'+esc(p.name)+' &middot; '+done+' of '+tasks.length+' complete'+(overdue?' &middot; <span style="color:var(--red)">'+overdue+' overdue</span>':'')+'</div></div>'+
     '<button class="btn bp" data-action="newMs" data-pid="'+p.id+'">+ Add Task</button>'+
     '<button class="btn bv bxs" data-action="syncTasks" data-pid="'+p.id+'" id="syncTasksBtn" style="font-size:11px"><i class="ti ti-refresh" aria-hidden="true"></i> Sync Google Tasks</button>'+
+    '<button class="btn bd bxs" data-action="cleanupDupes" data-pid="'+p.id+'" id="cleanupBtn" style="font-size:11px" title="Remove duplicate tasks from both ConstructTrack and Google Tasks">&#9003; Fix Duplicates</button>'+
     '</div></div>';
   if(!tasks.length){el.innerHTML=h+'<div class="card"><div class="es">No tasks yet. Add action items, submittals, RFIs, or anything that needs tracking.</div></div>';return;}
   // Group: overdue, then pending, then done
@@ -2827,6 +2829,26 @@ async function syncProjectTasks(p){
     var listId=await getOrCreateTaskList(p.name);
     if(!p._gtListId)p._gtListId=listId;
 
+    // Deduplicate existing milestones by name (keep the one with gtaskId if both exist)
+    var seen={};
+    var deduped=[];
+    p.milestones.forEach(function(m){
+      var key=m.name.trim().toLowerCase();
+      if(seen[key]){
+        // Keep the one with gtaskId, discard the other
+        if(m.gtaskId&&!seen[key].gtaskId){
+          deduped=deduped.filter(function(x){return x!==seen[key];});
+          seen[key]=m;deduped.push(m);
+        }
+        // else discard this duplicate
+      } else {
+        seen[key]=m;deduped.push(m);
+      }
+    });
+    if(deduped.length!==p.milestones.length){
+      p.milestones=deduped;changed=true;
+    }
+
     // Get all tasks from Google Tasks list
     var gtTasks=[];
     var pageToken=null;
@@ -2843,8 +2865,15 @@ async function syncProjectTasks(p){
     // Pull new tasks from Google Tasks into ConstructTrack
     gtTasks.forEach(function(gt){
       if(!gt.title||gt.title.trim()==='')return;
-      // Check if already imported
-      var existing=p.milestones.find(function(m){return m.gtaskId===gt.id;});
+      // Check if already imported - match by gtaskId OR by name (for existing tasks)
+      var existing=p.milestones.find(function(m){
+        return m.gtaskId===gt.id || m.name.trim().toLowerCase()===gt.title.trim().toLowerCase();
+      });
+      if(existing&&!existing.gtaskId){
+        // Link existing task to its Google Tasks counterpart
+        existing.gtaskId=gt.id;
+        changed=true;
+      }
       if(!existing){
         // New task from Google Tasks - import as Personal
         var dueDate='';
@@ -2946,6 +2975,86 @@ function backgroundTaskSync(){
   }
 }
 
+
+async function cleanupDuplicateTasks(pid){
+  var p=S.projects.find(function(x){return x.id===pid;});
+  if(!p)return;
+  var btn=document.getElementById('cleanupBtn');
+  if(btn){btn.textContent='Cleaning...';btn.disabled=true;}
+
+  try{
+    // Step 1: Get Google Tasks list
+    var listId=await getOrCreateTaskList(p.name);
+    var gtTasks=[];
+    var pageToken=null;
+    do{
+      var url='/lists/'+listId+'/tasks?showCompleted=true&showHidden=true'+(pageToken?'&pageToken='+pageToken:'');
+      var resp=await gtGet(url);
+      gtTasks=gtTasks.concat(resp.items||[]);
+      pageToken=resp.nextPageToken||null;
+    }while(pageToken);
+
+    // Step 2: Deduplicate Google Tasks by title - delete extras
+    var gtSeen={};
+    var deletePromises=[];
+    gtTasks.forEach(function(gt){
+      if(!gt.title)return;
+      var key=gt.title.trim().toLowerCase();
+      if(gtSeen[key]){
+        // Duplicate - delete this one from Google Tasks
+        var tok=GS.token;
+        deletePromises.push(
+          fetch(TASKS_BASE+'/lists/'+listId+'/tasks/'+gt.id,
+            {method:'DELETE',headers:{Authorization:'Bearer '+tok}})
+          .catch(function(){})
+        );
+      } else {
+        gtSeen[key]=gt;
+      }
+    });
+    await Promise.all(deletePromises);
+    console.log('Deleted '+deletePromises.length+' duplicate Google Tasks');
+
+    // Step 3: Deduplicate ConstructTrack milestones by name
+    var ctSeen={};
+    var deduped=[];
+    p.milestones.forEach(function(m){
+      var key=m.name.trim().toLowerCase();
+      if(ctSeen[key]){
+        // Keep the one with gtaskId
+        if(m.gtaskId&&!ctSeen[key].gtaskId){
+          deduped=deduped.filter(function(x){return x.id!==ctSeen[key].id;});
+          ctSeen[key]=m;deduped.push(m);
+        }
+        // else discard this one
+      } else {
+        ctSeen[key]=m;deduped.push(m);
+      }
+    });
+
+    // Step 4: Link CT tasks to GT tasks by name
+    deduped.forEach(function(m){
+      if(m.gtaskId)return;
+      var key=m.name.trim().toLowerCase();
+      if(gtSeen[key])m.gtaskId=gtSeen[key].id;
+    });
+
+    var removed=p.milestones.length-deduped.length;
+    p.milestones=deduped;
+
+    // Step 5: Save clean state to Sheets
+    await save();
+    render();
+
+    if(btn){btn.textContent='↺ Sync Google Tasks';btn.disabled=false;}
+    alert('Cleanup complete. Removed '+removed+' duplicate task(s) from ConstructTrack and '+deletePromises.length+' from Google Tasks.');
+
+  }catch(err){
+    console.error('Cleanup error:',err);
+    if(btn){btn.textContent='↺ Sync Google Tasks';btn.disabled=false;}
+    alert('Cleanup error: '+err.message);
+  }
+}
 
 function reauthorizeTasks(){
   if(GS.tokenClient){
