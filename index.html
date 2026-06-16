@@ -216,6 +216,7 @@ var CLIENT_ID_G="259016321752-j9o5f8iuhrtun8gm06qdb1c1bp4vjmbb.apps.googleuserco
 var SHEET_ID_G="1nrlRcO7iTKwVEHg-E50pmwaVfkaJWH9spljn3SaQPX4";
 var SCOPES_G="https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/tasks";
 var GS={token:null,user:null,tokenExpiry:0,tokenClient:null};
+var _tasksSyncedThisSession=false;
 
 function isTokenValid(){
   return GS.token && Date.now() < GS.tokenExpiry - 60000; // refresh 1min before expiry
@@ -519,7 +520,14 @@ function render(){
   var fns={ov:rOv,gantt:rGantt,ms:rMs,ph:rPh,sov:rSov,docs:rDocs,notes:rNotes,ai:rAi,perf:rPerf};
   if(fns[V])fns[V]();
 }
-function setView(v){V=v;render();if(v==='ms')backgroundTaskSync();}
+function setView(v){
+  var prevV=V;V=v;render();
+  // Only background sync on first visit to checklist tab, not every switch
+  if(v==='ms'&&prevV!=='ms'&&!_tasksSyncedThisSession){
+    _tasksSyncedThisSession=true;
+    backgroundTaskSync();
+  }
+}
 
 document.addEventListener('click',function(e){
   var t=e.target;
@@ -2938,24 +2946,32 @@ async function syncProjectTasks(p){
       }
     });
 
-    // Push new shared tasks (not yet in Google Tasks) to Google Tasks
-    var pushPromises=[];
-    p.milestones.forEach(function(m){
-      if(m.gtaskId)return; // already synced
-      if(m.visibility==='personal'&&(!m.createdBy||m.createdBy.toLowerCase()!==myEmail2))return;
-      // Create in Google Tasks
-      pushPromises.push(
-        gtPost('/lists/'+listId+'/tasks',{
-          title:m.name,
-          notes:m.note||'',
+    // Push new tasks to Google Tasks sequentially to avoid race/duplicate conditions
+    // Build title map from existing GT tasks for dedup
+    var gtByTitle={};
+    gtTasks.forEach(function(gt){if(gt.title)gtByTitle[gt.title.trim().toLowerCase()]=gt;});
+
+    for(var mi=0;mi<p.milestones.length;mi++){
+      var m=p.milestones[mi];
+      if(m.gtaskId)continue;
+      if(m.visibility==='personal'&&(!m.createdBy||m.createdBy.toLowerCase()!==myEmail2))continue;
+      var titleKey=m.name.trim().toLowerCase();
+      if(gtByTitle[titleKey]){
+        // Already exists in GT by name - just link it
+        m.gtaskId=gtByTitle[titleKey].id;changed=true;continue;
+      }
+      try{
+        var created=await gtPost('/lists/'+listId+'/tasks',{
+          title:m.name,notes:m.note||'',
           status:m.done?'completed':'needsAction',
           due:m.due?m.due+'T00:00:00.000Z':undefined
-        }).then(function(created){m.gtaskId=created.id;changed=true;})
-        .catch(function(){})
-      );
-    });
-
-    await Promise.all(savePromises.concat(pushPromises));
+        });
+        m.gtaskId=created.id;
+        gtByTitle[titleKey]=created; // prevent re-creating in same sync
+        changed=true;
+      }catch(gtErr){console.warn('Failed to push task:',m.name,gtErr);}
+    }
+    await Promise.all(savePromises);
     if(changed){save();render();}
 
   }catch(err){
